@@ -9,13 +9,50 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const isCaseInsensitiveFS = false
 
-// classifyNative is only used on Windows, where drive letters carry the
-// answer directly.
-func classifyNative(string) (Kind, string, bool) { return KindUnknown, "", false }
+// Filesystem magic numbers from <linux/magic.h>. statfs(2) reports these for
+// whatever filesystem a path is really on, which is how a mount gets caught
+// even when its mount point never matched by name.
+var remoteMagic = map[uint32]string{
+	0x6969: "nfs", 0xFF534D42: "cifs", 0xFE534D42: "smb2", 0x517B: "smbfs",
+	0x01021997: "9p", 0x00C36400: "ceph", 0x5346414F: "afs", 0x6B414653: "afs",
+	0x73757245: "coda", 0x564C: "ncpfs", 0x0BD00BD0: "lustre",
+	0x01161970: "gfs2", 0x7461636F: "ocfs2",
+}
+
+var pseudoMagic = map[uint32]string{
+	0x9FA0: "proc", 0x62656572: "sysfs", 0x01021994: "tmpfs", 0x858458F6: "ramfs",
+	0x1CD1: "devpts", 0x27E0EB: "cgroup", 0x63677270: "cgroup2",
+	0x73717368: "squashfs", 0xE0F5E1E2: "erofs", 0x64626720: "debugfs",
+	0x74726163: "tracefs", 0x73636673: "securityfs", 0xCAFE4A11: "bpf",
+	0x19800202: "mqueue", 0x0187: "autofs", 0xDE5E81E4: "efivarfs",
+	0x6E736673: "nsfs", 0x958458F6: "hugetlbfs", 0x62656570: "configfs",
+	0x6165676C: "pstore", 0x42494E4D: "binfmt_misc", 0xF97CFF8C: "selinuxfs",
+	0x67596969: "rpc_pipefs", 0x65735543: "fusectl",
+}
+
+// classifyNative asks the kernel what a path is really mounted on. Only remote
+// and virtual filesystems are answered here: anything else falls through to
+// the mount table, which is the only place that knows whether a local disk is
+// removable (statfs cannot tell an internal SSD from a USB stick).
+func classifyNative(path string) (Mount, bool) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return Mount{}, false
+	}
+	magic := uint32(st.Type)
+	if name, ok := remoteMagic[magic]; ok {
+		return Mount{Path: path, FSType: name, Kind: KindRemote}, true
+	}
+	if name, ok := pseudoMagic[magic]; ok {
+		return Mount{Path: path, FSType: name, Kind: KindPseudo}, true
+	}
+	return Mount{}, false
+}
 
 // Filesystems whose contents live on another machine.
 var remoteFSTypes = map[string]bool{

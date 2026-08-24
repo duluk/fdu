@@ -4,6 +4,7 @@ package main
 
 import (
 	"io/fs"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -12,7 +13,26 @@ import (
 // have to be too.
 const isCaseInsensitiveFS = true
 
-func classifyNative(string) (Kind, string, bool) { return KindUnknown, "", false }
+// classifyNative asks the kernel what filesystem a path is actually on.
+//
+// This is the authoritative answer and does not depend on matching mount-point
+// strings, which is important on macOS: getfsstat reports mount points under
+// /System/Volumes/Data, while firmlinks mean the same directory is walked as
+// /Users/..., /Applications/... and so on. Matching by path silently misses
+// those mounts, and a missed NFS mount gets walked instead of skipped.
+func classifyNative(path string) (Mount, bool) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return Mount{}, false
+	}
+	m := Mount{
+		Path:   cstr(st.Mntonname[:]),
+		FSType: cstr(st.Fstypename[:]),
+		Source: cstr(st.Mntfromname[:]),
+	}
+	m.Kind = classifyDarwin(path, m, st.Flags)
+	return m, true
+}
 
 // From <sys/mount.h>. Declared here rather than taken from the syscall package
 // so the build does not depend on which constants a given Go release exported.
@@ -75,13 +95,29 @@ func LoadMounts() (*MountTable, error) {
 		if m.Path == "" {
 			continue
 		}
-		m.Kind = classifyDarwin(m, sf.Flags)
+		m.Kind = classifyDarwin(m.Path, m, sf.Flags)
 		out = append(out, m)
+
+		// Also index the firmlinked spelling. A mount reported at
+		// /System/Volumes/Data/Users/x/Foo is walked as /Users/x/Foo, and
+		// having both means the cheap path lookup usually hits and the mount
+		// never has to be touched at all.
+		if alias, ok := strings.CutPrefix(m.Path, dataVolume); ok && alias != "" {
+			a := m
+			a.Path = alias
+			out = append(out, a)
+		}
 	}
 	return NewMountTable(out), nil
 }
 
-func classifyDarwin(m Mount, flags uint32) Kind {
+const dataVolume = "/System/Volumes/Data"
+
+// classifyDarwin judges a filesystem. walked is the path actually being
+// visited, which is not always the mount point: statfs on the firmlinked
+// /Users reports the data volume's mount point, so the duplicate rule below
+// has to test the walked path or it would skip the entire home directory.
+func classifyDarwin(walked string, m Mount, flags uint32) Kind {
 	switch {
 	case flags&mntLocal == 0:
 		return KindRemote
@@ -92,7 +128,7 @@ func classifyDarwin(m Mount, flags uint32) Kind {
 	// also expose all of them directly under "/". Walking both paths would
 	// count the same bytes twice, so the firmlinked names win and this mount
 	// point is passed over.
-	case m.Path == "/System/Volumes/Data":
+	case filepath.Clean(walked) == "/System/Volumes/Data":
 		return KindDuplicate
 
 	case flags&mntRemovable != 0:

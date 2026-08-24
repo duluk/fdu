@@ -122,8 +122,8 @@ func (t *MountTable) Containing(path string) (Mount, bool) {
 
 // Classify reports what sort of filesystem a path lives on.
 func (t *MountTable) Classify(path string) (Kind, string) {
-	if k, desc, ok := classifyNative(path); ok {
-		return k, desc
+	if m, ok := classifyNative(path); ok {
+		return m.Kind, m.Describe()
 	}
 	if m, ok := t.Containing(path); ok {
 		return m.Kind, m.Describe()

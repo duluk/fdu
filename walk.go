@@ -289,6 +289,17 @@ func (w *walker) walk(d *Dir, path string, dev uint64, own int64) {
 // considerDir decides whether to descend into a subdirectory, and returns the
 // device the subdirectory lives on.
 func (w *walker) considerDir(full string, e fs.DirEntry, parentDev uint64) (dev uint64, own int64, ok bool) {
+	// Cheapest check first. If the mount table already names this path and we
+	// are meant to leave it alone, bail out before touching it at all: the
+	// stat below would be served by the remote server, and statting the root
+	// of a slow or wedged NFS mount is exactly what we are trying to avoid.
+	if m, known := w.mounts.At(full); known {
+		if reason, skip := w.mountSkip(m); skip {
+			w.addSkip(full, reason)
+			return 0, 0, false
+		}
+	}
+
 	info, err := e.Info()
 	if err != nil {
 		w.addErr(err)
@@ -318,35 +329,24 @@ func (w *walker) considerDir(full string, e fs.DirEntry, parentDev uint64) (dev 
 
 	m, known := w.mounts.At(full)
 	if !known {
-		// A boundary the mount table did not name: bind mounts, btrfs
-		// subvolumes, snapshots. Treat as local, but the inode check below
-		// still protects against counting the same tree twice.
+		// The mount table did not name this path. Mount points do not always
+		// spell the same way they are walked -- macOS firmlinks report a
+		// mount under /System/Volumes/Data while it is reached as /Users/...
+		// -- so ask the kernel what this directory is really sitting on
+		// rather than assuming a boundary we cannot name is a local disk.
+		if nm, ok := classifyNative(full); ok {
+			m, known = nm, true
+		}
+	}
+	if !known {
+		// Genuinely unrecognised: bind mounts, btrfs subvolumes, snapshots.
+		// Treat as local; the inode check below still stops it being counted
+		// twice.
 		m = Mount{Path: full, Kind: KindLocal}
 	}
 
-	switch m.Kind {
-	case KindRemote:
-		if !w.cfg.IncludeRemote {
-			w.addSkip(full, "network filesystem"+fsNote(m)+" (-remote to include)")
-			return 0, 0, false
-		}
-	case KindRemovable:
-		if !w.cfg.IncludeExternal {
-			w.addSkip(full, "external/removable volume"+fsNote(m)+" (-external to include)")
-			return 0, 0, false
-		}
-	case KindPseudo:
-		if !w.cfg.IncludePseudo {
-			w.addSkip(full, "virtual filesystem"+fsNote(m)+" (-pseudo to include)")
-			return 0, 0, false
-		}
-	case KindCloud:
-		if !w.cfg.IncludeCloud {
-			w.addSkip(full, "cloud storage"+fsNote(m)+"; contents may not be on this disk (-cloud to include)")
-			return 0, 0, false
-		}
-	case KindDuplicate:
-		w.addSkip(full, "same data is reachable elsewhere in this scan, counted there")
+	if reason, skip := w.mountSkip(m); skip {
+		w.addSkip(full, reason)
 		return 0, 0, false
 	}
 
@@ -370,6 +370,31 @@ func dirOwnSize(path string, info fs.FileInfo, logical bool) int64 {
 		return 0
 	}
 	return diskSize(path, info, false)
+}
+
+// mountSkip applies the include flags to a classified filesystem.
+func (w *walker) mountSkip(m Mount) (string, bool) {
+	switch m.Kind {
+	case KindRemote:
+		if !w.cfg.IncludeRemote {
+			return "network filesystem" + fsNote(m) + " (-remote to include)", true
+		}
+	case KindRemovable:
+		if !w.cfg.IncludeExternal {
+			return "external/removable volume" + fsNote(m) + " (-external to include)", true
+		}
+	case KindPseudo:
+		if !w.cfg.IncludePseudo {
+			return "virtual filesystem" + fsNote(m) + " (-pseudo to include)", true
+		}
+	case KindCloud:
+		if !w.cfg.IncludeCloud {
+			return "cloud storage" + fsNote(m) + "; contents may not be on this disk (-cloud to include)", true
+		}
+	case KindDuplicate:
+		return "same data is reachable elsewhere in this scan, counted there", true
+	}
+	return "", false
 }
 
 func fsNote(m Mount) string {

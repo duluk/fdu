@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io/fs"
+	"os"
 	"strings"
 	"testing"
 )
@@ -109,5 +111,51 @@ func TestHumanAndComma(t *testing.T) {
 		if got := comma(n); got != want {
 			t.Errorf("comma(%d) = %q, want %q", n, got, want)
 		}
+	}
+}
+
+// The OrbStack case: a real mount that the mount table failed to name,
+// because its mount point does not spell the way the directory is walked.
+// Before the statfs fallback this fell through to "assume local" and the
+// scanner walked straight into it. /proc stands in for the NFS export.
+func TestMountMissingFromTableIsStillClassified(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err != nil {
+		t.Skip("no procfs on this platform")
+	}
+	rootInfo, err := os.Lstat("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootDev, ok := deviceOf(rootInfo)
+	if !ok {
+		t.Skip("no device numbers on this platform")
+	}
+
+	entries, err := os.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proc fs.DirEntry
+	for _, e := range entries {
+		if e.Name() == "proc" {
+			proc = e
+		}
+	}
+	if proc == nil {
+		t.Skip("/proc not present")
+	}
+
+	// A deliberately empty mount table: every path lookup misses.
+	w := &walker{cfg: Config{}, mounts: NewMountTable(nil)}
+	for i := range w.seen {
+		w.seen[i].m = make(map[inodeKey]struct{})
+	}
+
+	if _, _, walk := w.considerDir("/proc", proc, rootDev); walk {
+		t.Fatal("descended into /proc with an empty mount table; " +
+			"an unnamed mount is being treated as local disk")
+	}
+	if len(w.skip) != 1 || !strings.Contains(w.skip[0].Reason, "virtual") {
+		t.Fatalf("expected a virtual-filesystem skip, got %+v", w.skip)
 	}
 }

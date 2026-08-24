@@ -274,23 +274,24 @@ func volumeRoot(path string) (string, bool) {
 
 // classifyNative answers directly from the drive letter, which also covers UNC
 // paths that never appear in the logical-drive list.
-func classifyNative(path string) (Kind, string, bool) {
+func classifyNative(path string) (Mount, bool) {
 	if strings.HasPrefix(path, `\\`) && !strings.HasPrefix(path, `\\?\`) {
-		return KindRemote, "a UNC network path", true
+		return Mount{Path: path, FSType: "UNC", Kind: KindRemote}, true
 	}
 	root, ok := volumeRoot(path)
 	if !ok {
-		return KindUnknown, "", false
+		return Mount{}, false
 	}
 	t := driveType(root)
 	if t == driveUnknown {
-		return KindUnknown, "", false
+		return Mount{}, false
 	}
-	desc := driveDesc(t)
-	if n := fsName(root); n != "" {
-		desc = fmt.Sprintf("%s (%s, %s)", desc, strings.TrimSuffix(root, `\`), n)
-	}
-	return kindOfDrive(t), desc, true
+	return Mount{
+		Path:   root,
+		FSType: fsName(root),
+		Source: strings.TrimSuffix(root, `\`),
+		Kind:   kindOfDrive(t),
+	}, true
 }
 
 // LoadMounts enumerates the drive letters. Volumes mounted into a folder are

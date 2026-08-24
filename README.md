@@ -103,6 +103,20 @@ path components, so all of these work:
 Skipped subtrees are always listed at the end of the report with a reason, so
 nothing disappears silently.
 
+Classification asks the kernel, via `statfs(2)`, what a directory is really
+sitting on. It does **not** work by matching mount-point strings, because mount
+points do not always spell the way they are walked: on macOS `getfsstat`
+reports a mount under `/System/Volumes/Data/Users/you/Thing` while firmlinks
+mean the same directory is reached as `/Users/you/Thing`. A name-matching
+scanner misses that mount entirely and walks into it. If the filesystem turns
+out to be one that has to be skipped, that costs a single `statfs` call and
+nothing underneath is ever touched.
+
+The mount table is still read at startup and consulted *first*, because a hit
+there is free and means a slow or wedged network mount is never touched at all.
+It is also the only source that knows whether a local disk is removable, which
+`statfs` cannot tell.
+
 **Linux** reads `/proc/self/mountinfo`. Filesystem type decides remote (`nfs`,
 `cifs`, `sshfs`, `ceph`, ...) and virtual (`proc`, `sysfs`, `tmpfs`, `cgroup`,
 ...). Removable is resolved through sysfs: the kernel's `removable` flag plus
@@ -251,7 +265,7 @@ fs_unix.go     shared Linux/macOS stat helpers
 fs_linux.go    /proc/self/mountinfo, sysfs removable detection
 fs_darwin.go   getfsstat, MNT_LOCAL/MNT_REMOVABLE, firmlinks
 fs_windows.go  GetDriveType, reparse tags, cloud placeholders
-fdu_test.go    tests for cloud accounting, excludes, formatting
+fdu_test.go    tests for classification, cloud accounting, excludes
 ```
 
 ## Tests
