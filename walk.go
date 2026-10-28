@@ -27,6 +27,7 @@ type Config struct {
 	Logical         bool
 	CountHardlinks  bool
 	ByExt           bool
+	Suggest         bool
 	Quiet           bool
 }
 
@@ -65,8 +66,9 @@ func (d *Dir) Path() string {
 
 // FileEnt is one of the largest files found.
 type FileEnt struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
+	Path     string    `json:"path"`
+	Size     int64     `json:"size"`
+	Modified time.Time `json:"-"` // only recorded for -suggest
 }
 
 // Skip records a subtree that was deliberately not descended into.
@@ -100,6 +102,11 @@ type Result struct {
 	// Placeholders: files listed in the tree whose data is not on this disk.
 	// Counted only so the report can explain why a cloud folder looks small.
 	CloudFiles int64
+
+	// -suggest only: a deeper list of large files than -top keeps, with
+	// modification times, and what was made of them.
+	Candidates  []FileEnt
+	Suggestions *Suggestions
 }
 
 const maxStoredErrors = 25
@@ -117,10 +124,11 @@ type walker struct {
 	errCount   atomic.Int64
 	hardSave   atomic.Int64
 	cloudFiles atomic.Int64
-	topMin     atomic.Int64
+
+	top  topList
+	cand topList // -suggest's candidates, independent of -top
 
 	mu   sync.Mutex
-	top  fileHeap
 	errs []string
 	skip []Skip
 
@@ -147,7 +155,12 @@ func Scan(root string, fi fs.FileInfo, cfg Config, mounts *MountTable) *Result {
 		sem:    make(chan struct{}, cfg.Jobs),
 		start:  time.Now(),
 	}
-	w.topMin.Store(1) // never bother tracking empty files
+	w.top.n = cfg.TopN
+	w.top.min.Store(1) // never bother tracking empty files
+	if cfg.Suggest {
+		w.cand.n = suggestFiles
+		w.cand.min.Store(minFileSuggest)
+	}
 	for i := range w.seen {
 		w.seen[i].m = make(map[inodeKey]struct{})
 	}
@@ -194,13 +207,8 @@ func Scan(root string, fi fs.FileInfo, cfg Config, mounts *MountTable) *Result {
 	}
 	sort.Slice(res.Skipped, func(i, j int) bool { return res.Skipped[i].Path < res.Skipped[j].Path })
 
-	for w.top.Len() > 0 {
-		res.TopFiles = append(res.TopFiles, heap.Pop(&w.top).(FileEnt))
-	}
-	// heap pops smallest-first; the report wants biggest-first.
-	for i, j := 0, len(res.TopFiles)-1; i < j; i, j = i+1, j-1 {
-		res.TopFiles[i], res.TopFiles[j] = res.TopFiles[j], res.TopFiles[i]
-	}
+	res.TopFiles = w.top.largest()
+	res.Candidates = w.cand.largest()
 
 	if cfg.ByExt {
 		for i := range w.exts {
@@ -274,7 +282,10 @@ func (w *walker) walk(d *Dir, path string, dev uint64, own int64) {
 
 		selfSize += size
 		selfFiles++
-		w.offerTop(full, size)
+		w.top.offer(FileEnt{Path: full, Size: size})
+		if w.cfg.Suggest {
+			w.cand.offer(FileEnt{Path: full, Size: size, Modified: info.ModTime()})
+		}
 		if w.cfg.ByExt {
 			w.addExt(name, size)
 		}
@@ -466,19 +477,41 @@ func (w *walker) markVisited(k inodeKey) bool {
 	return dup
 }
 
-func (w *walker) offerTop(path string, size int64) {
-	if w.cfg.TopN == 0 || size < w.topMin.Load() {
+// topList keeps the n largest files offered to it. min lets the common case,
+// a file too small to make the list, be turned away without taking the lock.
+type topList struct {
+	n   int
+	min atomic.Int64
+	mu  sync.Mutex
+	h   fileHeap
+}
+
+func (t *topList) offer(f FileEnt) {
+	if t.n == 0 || f.Size < t.min.Load() {
 		return
 	}
-	w.mu.Lock()
-	heap.Push(&w.top, FileEnt{Path: path, Size: size})
-	if w.top.Len() > w.cfg.TopN {
-		heap.Pop(&w.top)
+	t.mu.Lock()
+	heap.Push(&t.h, f)
+	if t.h.Len() > t.n {
+		heap.Pop(&t.h)
 	}
-	if w.top.Len() == w.cfg.TopN {
-		w.topMin.Store(w.top[0].Size)
+	if t.h.Len() == t.n {
+		t.min.Store(t.h[0].Size)
 	}
-	w.mu.Unlock()
+	t.mu.Unlock()
+}
+
+// largest empties the list, biggest first.
+func (t *topList) largest() []FileEnt {
+	var out []FileEnt
+	for t.h.Len() > 0 {
+		out = append(out, heap.Pop(&t.h).(FileEnt))
+	}
+	// heap pops smallest-first; the report wants biggest-first.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
 func (w *walker) addExt(name string, size int64) {

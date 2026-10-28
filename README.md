@@ -36,6 +36,7 @@ fdu ~/Library             # a macOS home directory
 fdu C:\Users              # a Windows profile tree
 fdu -remote /mnt/nas      # a network share, which is skipped by default
 fdu -json / > usage.json  # machine-readable
+fdu -suggest ~            # also list what could be cleared to free space
 ```
 
 Sample:
@@ -75,6 +76,7 @@ up. Lower it to `0.1` to go deeper, raise it to `5` for a one-screen summary.
 | `-depth N` | Stop printing below this depth. Default 0 (no limit). |
 | `-top N` | How many of the largest individual files to list. Default 20. |
 | `-by-ext` | Also break usage down by file extension. |
+| `-suggest` | Also list caches, build output, old downloads and Docker data that could be cleared. Nothing is deleted. |
 | `-remote` | Include network filesystems. |
 | `-external` | Include external/removable volumes. |
 | `-pseudo` | Include virtual filesystems (procfs, tmpfs, squashfs, ...). |
@@ -97,6 +99,106 @@ path components, so all of these work:
 -exclude '/home/*/Downloads'     # a specific shape of path
 -exclude '*.iso'                 # by extension
 ```
+
+## Finding things to delete: `-suggest`
+
+`-suggest` adds a **Could be cleared** section to the end of the report. It
+never deletes anything. Each suggestion gives the size, where it is, and the
+command that would clear it, so you decide what actually goes:
+
+```
+Could be cleared   (suggestions only; nothing has been deleted)
+------------------------------------------------------------
+
+Safe to clear: rebuilt or re-downloaded automatically when needed
+
+  37.4 GiB  Rust build output (target)
+            rebuilt by cargo build
+            ~/src/modal-lab/target
+            $ rm -rf ~/src/modal-lab/target
+
+  26.5 GiB  npm download cache
+            ~/.npm/_cacache
+            $ npm cache clean --force
+
+   1.1 GiB  node_modules folders (10)
+            reinstalled by npm, yarn or pnpm install
+              310 MiB  ~/src/paper-writer/node_modules
+              282 MiB  ~/src/deepresearch/web/node_modules
+            ... and 8 more (508 MiB)
+            $ rm -rf <folder>
+
+Review first: may hold something you want to keep
+
+  10.4 GiB  Installers, disk images and archives (8)
+            usually safe to delete once installed or unpacked
+              4.5 GiB  ~/src/sefaria/mongodb.dump.tar.gz   (modified 17 months ago)
+              ...
+
+Docker: as reported by `docker system df`
+
+   9.0 GiB  Unused images (16 of 25)
+            re-pulled or rebuilt when next needed
+            $ docker image prune -a
+
+------------------------------------------------------------
+  84.4 GiB  safe to clear
+  14.3 GiB  worth reviewing
+  10.2 GiB  reclaimable inside Docker
+```
+
+Suggestions come in two kinds:
+
+- **Safe to clear.** Caches and build output that tools rebuild or
+  re-download on their own: `~/Library/Caches`, `~/.cache`, the npm, pip,
+  Go, Cargo, Gradle, Maven, Homebrew, Yarn, pnpm and Conda caches, Xcode
+  DerivedData and device support files, the Trash, Linux package caches
+  (apt, dnf, pacman) and the systemd journal, and Windows temp folders, the
+  Internet cache and Windows Update downloads. Project folders count too:
+  `node_modules`, Rust `target/`, Gradle `build/`, `Pods`, `.next`,
+  `.terraform`, `__pycache__` and similar.
+- **Review first.** Things that are probably clutter but might not be:
+  installers, disk images and archives (`.dmg`, `.iso`, `.pkg`, `.zip`,
+  `.tar.gz`, ...), large files not modified in over six months, Python
+  virtual environments, Xcode archives, simulators, iPhone backups, Ollama
+  and Hugging Face models, temp folders, and stopped Docker containers and
+  unused volumes.
+
+It tries hard not to suggest something that isn't clutter:
+
+- **Known places only.** A cache is suggested because it is a known place,
+  such as `~/Library/Caches/Homebrew`, never just because a folder is called
+  "cache".
+- **Project folders need proof.** A project folder needs the file that proves
+  what it is right beside it: `node_modules` needs `package.json`, `target`
+  needs `Cargo.toml`, a venv needs its `pyvenv.cfg`.
+- **Some places are off-limits.** Project-folder matching and old-file
+  suggestions stay out of system directories (`/usr`, `/System`,
+  `C:\Windows`, ...), application data (`~/Library`, `AppData`),
+  self-contained installs (`~/anaconda3`, ...), tools' own dot-folders in
+  your home directory (`~/.vscode`, `~/.nvm`, ...), app and library bundles
+  (`*.app`, `*.photoslibrary`), and version-control data (`.git`). A
+  `node_modules` inside a VS Code extension is part of the extension.
+- **Nothing is counted twice.** A cache inside a cache is listed on its own,
+  with its own command, and subtracted from the outer one. A file already
+  inside a suggested folder is not listed again.
+- **Small items are left out.** Anything under 10 MiB is not shown, and only
+  files of 50 MiB or more are considered.
+
+**Docker.** Images, containers and volumes live inside Docker's own storage,
+which a directory walk sees as one opaque lump: `Docker.raw` for Docker
+Desktop, `data.img` for OrbStack, `/var/lib/docker` on Linux. So `-suggest`
+runs `docker system df` while the scan is running and reports what Docker
+says it could reclaim, with the matching `prune` command. If there is no
+`docker` command it says nothing. If Docker is installed but not running, the
+report says so. It waits at most 20 seconds. On macOS, Docker Desktop and
+OrbStack hand freed space back to the system on their own, which can take a
+few minutes. Do not delete the disk image itself: that throws away every
+image, container and volume.
+
+With `-json`, the same information appears under a `suggestions` key, with
+every path listed rather than the first five. Without `-suggest`, both the
+text and the JSON output are exactly as before.
 
 ## What gets skipped, and how it decides
 
@@ -260,12 +362,16 @@ running the machine out of RAM.
 main.go        flags, start-path validation
 walk.go        concurrent walker, tree, hardlink and mount dedup
 report.go      text and JSON output
+suggest.go     -suggest: matching the tree against the rules
+rules.go       -suggest: known cache locations and project folders, per OS
+docker.go      -suggest: asking Docker what it could prune
 mounts.go      cross-platform mount table
 fs_unix.go     shared Linux/macOS stat helpers
 fs_linux.go    /proc/self/mountinfo, sysfs removable detection
 fs_darwin.go   getfsstat, MNT_LOCAL/MNT_REMOVABLE, firmlinks
 fs_windows.go  GetDriveType, reparse tags, cloud placeholders
 fdu_test.go    tests for classification, cloud accounting, excludes
+suggest_test.go  tests for -suggest
 ```
 
 ## Tests

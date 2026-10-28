@@ -37,6 +37,8 @@ space, the largest individual files, and anything it had to skip.
   fdu /home             everything under /home
   fdu C:\Users          a Windows profile tree
   fdu -remote /mnt/nas  include a network share that would be skipped
+  fdu -suggest ~        also list caches, build output and other clutter
+                        that could be cleared (nothing is ever deleted)
 
 By default it ignores network filesystems, external/removable volumes and
 virtual filesystems (procfs, tmpfs, squashfs images, ...). It stays inside
@@ -61,6 +63,7 @@ func main() {
 	flag.Float64Var(&ropt.MinPercent, "min-percent", 1.0, "hide directories holding less than this percent of the total")
 	flag.IntVar(&ropt.MaxDepth, "depth", 0, "maximum directory depth to print (0 = no limit)")
 	flag.BoolVar(&ropt.ByExt, "by-ext", false, "also summarise usage by file extension")
+	flag.BoolVar(&cfg.Suggest, "suggest", false, "also suggest caches, build output, old downloads and Docker data that could be cleared (nothing is deleted)")
 
 	flag.BoolVar(&cfg.IncludeRemote, "remote", false, "include network/remote filesystems (NFS, SMB, sshfs, ...)")
 	flag.BoolVar(&cfg.IncludeExternal, "external", false, "include external/removable volumes (USB disks, DVDs, mounted images)")
@@ -140,7 +143,31 @@ func main() {
 		}
 	}
 
+	// Docker is asked while the scan runs: it can take a few seconds to
+	// answer, and the scan usually takes longer.
+	var docker chan dockerResult
+	if cfg.Suggest {
+		docker = make(chan dockerResult, 1)
+		go func() { docker <- queryDocker() }()
+	}
+
 	res := Scan(abs, fi, cfg, mounts)
+
+	if cfg.Suggest {
+		var d dockerResult
+		select {
+		case d = <-docker:
+		default:
+			if !cfg.Quiet {
+				fmt.Fprint(os.Stderr, "\r\033[Kwaiting for Docker...")
+			}
+			d = <-docker
+			if !cfg.Quiet {
+				fmt.Fprint(os.Stderr, "\r\033[K")
+			}
+		}
+		res.Suggestions = Suggest(res, d)
+	}
 
 	if jsonOut {
 		if err := writeJSON(os.Stdout, res, ropt); err != nil {

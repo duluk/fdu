@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +41,7 @@ func writeReport(out io.Writer, res *Result, o ReportOpts) {
 	if total == 0 {
 		fmt.Fprintf(out, "\nNothing to report: no files were readable under this path.\n")
 		writeProblems(out, res)
+		writeSuggestions(out, res.Suggestions, o.SI)
 		return
 	}
 
@@ -68,6 +71,7 @@ func writeReport(out io.Writer, res *Result, o ReportOpts) {
 	}
 
 	writeProblems(out, res)
+	writeSuggestions(out, res.Suggestions, o.SI)
 }
 
 func writeProblems(out io.Writer, res *Result) {
@@ -97,6 +101,141 @@ func writeProblems(out io.Writer, res *Result) {
 		}
 	}
 	fmt.Fprintln(out)
+}
+
+// writeSuggestions prints what -suggest found, safest first. It runs last so
+// the things to act on are what is left on screen.
+func writeSuggestions(out io.Writer, sg *Suggestions, si bool) {
+	if sg == nil {
+		return
+	}
+	fmt.Fprintf(out, "Could be cleared   (suggestions only; nothing has been deleted)\n%s\n", strings.Repeat("-", 60))
+
+	sections := []struct {
+		safety Safety
+		head   string
+	}{
+		{Safe, "Safe to clear: rebuilt or re-downloaded automatically when needed"},
+		{Review, "Review first: may hold something you want to keep"},
+	}
+	for _, sec := range sections {
+		first := true
+		for _, it := range sg.Items {
+			if it.Safety != sec.safety {
+				continue
+			}
+			if first {
+				fmt.Fprintf(out, "\n%s\n", sec.head)
+				first = false
+			}
+			writeSuggestion(out, it, si)
+		}
+	}
+	if len(sg.Items) == 0 {
+		fmt.Fprintf(out, "\nNothing obvious to clear under this path.\n")
+	}
+
+	if len(sg.Docker) > 0 {
+		fmt.Fprintf(out, "\nDocker: as reported by `docker system df`\n")
+		fmt.Fprintf(out, "%sPrune with these commands. Deleting Docker's disk image (Docker.raw,\n", suggestPad)
+		fmt.Fprintf(out, "%sOrbStack's data.img) instead would lose every image, container and volume.\n", suggestPad)
+		for _, it := range sg.Docker {
+			writeSuggestion(out, it, si)
+		}
+	} else if sg.DockerNote != "" {
+		fmt.Fprintf(out, "\nDocker: not checked (%s)\n", sg.DockerNote)
+	}
+
+	safe, review, docker := sg.totals()
+	if safe+review+docker > 0 {
+		fmt.Fprintf(out, "\n%s\n", strings.Repeat("-", 60))
+		for _, t := range []struct {
+			n     int64
+			label string
+		}{{safe, "safe to clear"}, {review, "worth reviewing"}, {docker, "reclaimable inside Docker"}} {
+			if t.n > 0 {
+				fmt.Fprintf(out, "%10s  %s\n", human(t.n, si), t.label)
+			}
+		}
+	}
+	fmt.Fprintln(out)
+}
+
+// suggestPad lines detail up under a suggestion's title.
+var suggestPad = strings.Repeat(" ", 12)
+
+const maxSuggestPaths = 5
+
+func writeSuggestion(out io.Writer, it Suggestion, si bool) {
+	title := it.Title
+	if len(it.Paths) > 1 {
+		title += fmt.Sprintf(" (%s)", comma(int64(len(it.Paths))))
+	}
+	fmt.Fprintf(out, "\n%10s  %s\n", human(it.Size, si), title)
+	if it.Note != "" {
+		fmt.Fprintf(out, "%s%s\n", suggestPad, it.Note)
+	}
+
+	if len(it.Paths) == 1 && it.Paths[0].Modified == nil {
+		fmt.Fprintf(out, "%s%s\n", suggestPad, tilde(it.Paths[0].Path))
+	} else if len(it.Paths) > 0 {
+		shown := it.Paths
+		if len(shown) > maxSuggestPaths {
+			shown = shown[:maxSuggestPaths]
+		}
+		for _, p := range shown {
+			age := ""
+			if p.Modified != nil && !p.Modified.IsZero() {
+				age = "   (" + ageOf(*p.Modified) + ")"
+			}
+			fmt.Fprintf(out, "%s%9s  %s%s\n", suggestPad, human(p.Size, si), tilde(p.Path), age)
+		}
+		if rest := it.Paths[len(shown):]; len(rest) > 0 {
+			var n int64
+			for _, p := range rest {
+				n += p.Size
+			}
+			fmt.Fprintf(out, "%s... and %s more (%s)\n", suggestPad, comma(int64(len(rest))), human(n, si))
+		}
+	}
+
+	if it.Command != "" {
+		prompt := "$"
+		if runtime.GOOS == "windows" {
+			prompt = "PS>"
+		}
+		fmt.Fprintf(out, "%s%s %s\n", suggestPad, prompt, it.Command)
+	}
+}
+
+// tilde shortens paths in the invoking user's home directory for display.
+func tilde(p string) string {
+	if runtime.GOOS == "windows" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == home {
+		return "~"
+	}
+	if rest, ok := strings.CutPrefix(p, home+"/"); ok {
+		return "~/" + rest
+	}
+	return p
+}
+
+// ageOf says roughly how long ago a file was last modified.
+func ageOf(t time.Time) string {
+	days := int(time.Since(t).Hours() / 24)
+	switch {
+	case days < 60:
+		return fmt.Sprintf("modified %d days ago", days)
+	case days < 730:
+		return fmt.Sprintf("modified %d months ago", days/30)
+	}
+	return fmt.Sprintf("modified %d years ago", days/365)
 }
 
 // printNode prints one directory and recurses into the children that clear the
@@ -258,6 +397,17 @@ type jsonReport struct {
 	Skipped    []Skip    `json:"skipped"`
 	Errors     []string  `json:"errors"`
 	ErrorCount int64     `json:"error_count"`
+
+	Suggestions *jsonSuggestions `json:"suggestions,omitempty"`
+}
+
+type jsonSuggestions struct {
+	SafeBytes   int64        `json:"safe_bytes"`
+	ReviewBytes int64        `json:"review_bytes"`
+	DockerBytes int64        `json:"docker_bytes"`
+	Items       []Suggestion `json:"items"`
+	Docker      []Suggestion `json:"docker"`
+	DockerNote  string       `json:"docker_note,omitempty"`
 }
 
 func writeJSON(out io.Writer, res *Result, o ReportOpts) error {
@@ -286,6 +436,17 @@ func writeJSON(out io.Writer, res *Result, o ReportOpts) error {
 	}
 	if rep.Errors == nil {
 		rep.Errors = []string{}
+	}
+	if sg := res.Suggestions; sg != nil {
+		js := &jsonSuggestions{Items: sg.Items, Docker: sg.Docker, DockerNote: sg.DockerNote}
+		js.SafeBytes, js.ReviewBytes, js.DockerBytes = sg.totals()
+		if js.Items == nil {
+			js.Items = []Suggestion{}
+		}
+		if js.Docker == nil {
+			js.Docker = []Suggestion{}
+		}
+		rep.Suggestions = js
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
