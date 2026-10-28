@@ -15,6 +15,16 @@ pointing it at `/` on a work laptop measures the laptop, not the NAS.
 Pure standard library, no dependencies. Go 1.21+.
 
 ```
+make              # builds ./fdu for this machine
+make install      # puts fdu in $(go env GOPATH)/bin
+make check        # gofmt check, go vet on every platform, tests
+make cross        # every platform into dist/
+make help         # everything else
+```
+
+Or without make:
+
+```
 go build -o fdu .
 ```
 
